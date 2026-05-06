@@ -21,7 +21,6 @@ typedef struct ADDR {
 
 // Arguments passed to each master worker thread.
 // Each thread gets its own slice of the matrix to send to one slave.
-// TO ADD: COMP ARGS
 typedef struct ARGS {
     int rows;       
     int start_row;   
@@ -34,9 +33,6 @@ typedef struct ARGS {
     float *p;               
     pthread_mutex_t *mutex;
 } args;
-
-
-
 
 // ------------------------------------------------------------------
 // Helper Functions -------------------------------------------------
@@ -129,7 +125,6 @@ void *mse_wma(void *arg){
 }
 
 
-
 // MASTER WORKER THREAD
 // Where each thread is responsible for sending one submatrix to one slave and 
 // thread opens its own dedicated TCP connection to a single slave.
@@ -206,6 +201,11 @@ void *worker(void *arg) {
     } else {
         fprintf(stderr, "[Thread] WARNING: Invalid ACK from slave (%s:%d): '%s'\n",
                 a->slave->ip, a->slave->port, ack);
+    }
+
+    // Receive the result from the slave
+    for (int r = 0; r < a->rows; r++) {
+        recv_all(sock, a->p[a->start_row + r], sizeof(float) * a->n);
     }
 
     close(sock);
@@ -377,25 +377,10 @@ void slave(int n, int p) {
             recv_all(sock, submatrix[i], sizeof(float) * n_cols);
         }
 
-        printf("[Slave] Received submatrix: %d rows x %d cols\n", rows, n_cols);
-
-        struct timespec time_before, time_after;
-
-        // time_before: the moment the slave received the rows and before computation
-        clock_gettime(CLOCK_MONOTONIC, &time_before);
-
         // Send ACK to master
         send_all(sock, "ack", 3);
 
-        // time_after: immediately after sending ACK.
-        clock_gettime(CLOCK_MONOTONIC, &time_after);
-
-        double elapsed =
-            (time_after.tv_sec  - time_before.tv_sec) +
-            (time_after.tv_nsec - time_before.tv_nsec) / 1e9;
-
-        printf("[Slave] time_elapsed = %.9f seconds\n", elapsed);
-
+        printf("[Slave] Received submatrix: %d rows x %d cols\n", rows, n_cols);
 
         // Prints the received submatrix for verification
         printf("\n[Slave] === Submatrix Verification ===\n");
@@ -414,6 +399,34 @@ void slave(int n, int p) {
                    rows - 1, n_cols - 1, submatrix[rows-1][n_cols-1]);
         }
         printf("[Slave] === End Verification ===\n\n");
+
+        // initialize the arguments for computation
+        args comp_args;
+        comp_args->X = submatrix;
+        comp_args->q = q;
+        comp_args->weight_sum = weight_sum;
+        comp_args->w = w;
+        comp_args->p = p;
+
+        struct timespec time_before, time_after;
+
+        // time_before: the moment the slave received the rows and before computation
+        clock_gettime(CLOCK_MONOTONIC, &time_before);
+
+        // Perform the computation
+        mse_wma(&comp_args);
+
+        // time_after: immediately after sending ACK.
+        clock_gettime(CLOCK_MONOTONIC, &time_after);
+
+        double elapsed =
+            (time_after.tv_sec  - time_before.tv_sec) +
+            (time_after.tv_nsec - time_before.tv_nsec) / 1e9;
+
+        printf("[Slave] time_elapsed = %.9f seconds\n", elapsed);
+
+        // Send p back to the master
+        send_all(sock, comp_args.p, sizeof(float) * n);
 
         // Free the allocated submatrix 
         for (int i = 0; i < rows; i++) free(submatrix[i]);
