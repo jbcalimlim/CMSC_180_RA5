@@ -28,7 +28,7 @@ typedef struct ADDR {
 // Each thread gets its own slice of the matrix to send to one slave
 // and receives the corresponding partial p vector back.
 typedef struct ARGS {
-    int rows;               // Number of rows assigned to this slave
+    int rows;               // Number of rows (assigned column) assigned to this slave
     int start_row;          // Starting row index in the full matrix X
     int n;                  // Total number of columns (matrix is n x n)
     addr *slave;            // Slave's IP and port
@@ -77,44 +77,103 @@ void send_all(int sock, void *buffer, size_t size) {
     }
 }
 
+// Transpose function
+float **transpose_matrix(float **X, int n) {
+
+    float **XT = malloc(sizeof(float*) * n);
+
+    for (int i = 0; i < n; i++) {
+        XT[i] = malloc(sizeof(float) * n);
+    }
+
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            XT[i][j] = X[j][i];
+        }
+    }
+
+    return XT;
+}
+
 
 // ------------------------------------------------------------------
 // WMA + MSE Computation -------------------------------------------
 // ------------------------------------------------------------------
 
-void mse_wma(float **X, int m, int n, int q, float weight_sum,
-             float *w, float *p_out) {
-
-    // Guard: need at least q+1 rows to compute one WMA value
-    if (m <= q) {
-        for (int j = 0; j < n; j++) p_out[j] = 0.0f;
+void mse_wma_transposed(float **XT,
+                        int assigned_cols,
+                        int n,
+                        int q,
+                        float weight_sum,
+                        float *w,
+                        float *p_out)
+{
+    if (n <= q) {
+        for (int j = 0; j < assigned_cols; j++) {
+            p_out[j] = 0.0f;
+        }
         return;
     }
 
-    // Process each column independently
-    for (int j = 0; j < n; j++) {
-        float local_sum = 0.0f; // the local sum
+    float *weight_diff =
+        malloc(sizeof(float) * (q - 1));
 
-        // Compute WMA for rows i from q to m-1
-        for (int i = q; i < m; i++) {
-            float weighted = 0.0f; // weighted sum
-            
-            // Computes for the WMA
-            for (int k = 0; k < q; k++) {
-                weighted += (w[k] * X[i - q + k][j]);
-            }   
+    for (int k = 0; k < q - 1; k++) {
+        weight_diff[k] = w[k] - w[k + 1];
+    }
 
-            // Compute for the mse
-            float wma_result = weighted / weight_sum; 
-            float sum_difference = X[i][j] - wma_result; 
-            local_sum += sum_difference * sum_difference;
+    // each row of XT is one ORIGINAL column
+    for (int col = 0; col < assigned_cols; col++) {
+
+        float weighted = 0.0f;
+        float diff_sum = 0.0f;
+        float mse_sum  = 0.0f;
+
+        // initialize window
+        for (int k = 0; k < q; k++) {
+            weighted += w[k] * XT[col][k];
         }
 
-        // p_out[j] stores the MSE for column j
-        p_out[j] = sqrtf(local_sum) / (m - q);
-    }
-}
+        // initialize diff_sum
+        for (int k = 0; k < q - 1; k++) {
+            diff_sum +=
+                weight_diff[k] * XT[col][k + 1];
+        }
 
+        // sliding window
+        for (int i = q; i < n; i++) {
+
+            float wma = weighted / weight_sum;
+
+            float diff =
+                XT[col][i] - wma;
+
+            mse_sum += diff * diff;
+
+            if (i + 1 < n && q > 1) {
+
+                diff_sum +=
+                    weight_diff[q - 2] * XT[col][i];
+
+                diff_sum -=
+                    weight_diff[0] * XT[col][i - q + 1];
+
+                weighted -=
+                    w[0] * XT[col][i - q];
+
+                weighted +=
+                    w[q - 1] * XT[col][i];
+
+                weighted += diff_sum;
+            }
+        }
+
+        p_out[col] =
+            sqrtf(mse_sum) / (n - q);
+    }
+
+    free(weight_diff);
+}
 
 // ------------------------------------------------------------------
 // Master Worker Thread ---------------------------------------------
@@ -558,9 +617,11 @@ int main() {
 
         fclose(file);
 
+        // Transpose matrix to swap rows and columns
         // Distribute submatrices to slaves and collect partial p vectors
         // master() handles spawning threads, timing, and joining
-        master(n, num_slaves, slave_addresses, X, q, weight_sum, w, result_p);
+        float **XT = transpose_matrix(X, n);
+        master(n, num_slaves, slave_addresses, XT, q, weight_sum, w, result_p);
 
         // Print assembled result vector p (first 10 entries max)
         printf("\n[Master] Result vector p (first %d entries):\n", (n < 10 ? n : 10));
